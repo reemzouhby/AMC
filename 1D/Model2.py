@@ -1,0 +1,219 @@
+import pickle
+import numpy as np
+from sklearn.preprocessing import LabelEncoder
+from sklearn.model_selection import train_test_split
+from torch.utils.data import DataLoader, Dataset
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import matplotlib.pyplot as plt
+from sklearn.metrics import accuracy_score
+from googlenet1d import GoogLeNet1D
+
+# ── 1. MyDataset ──────────────────────────────────────────────────────────────
+class MyDataset(Dataset):
+    def __init__(self, data, label):
+        self.data = data
+        self.label = label
+
+    def __getitem__(self, index):
+        return (
+            torch.tensor(self.data[index], dtype=torch.float),
+            torch.tensor(self.label[index], dtype=torch.long)
+        )
+
+    def __len__(self):
+        return len(self.data)
+
+# ── 2. Load Data ──────────────────────────────────────────────────────────────
+with open(r"C:\Users\Omen\OneDrive\Desktop\Master\Computer_vision\Data\RML2016.10a_dict.pkl", "rb") as f:
+    data = pickle.load(f, encoding="latin1")
+
+# ── 3. Extract X, y, SNR ──────────────────────────────────────────────────────
+X, y, snrs = [], [], []
+for (mod, snr), samples in data.items():
+    X.append(samples)
+    y.extend([mod] * len(samples))
+    snrs.extend([snr] * len(samples))
+
+X    = np.vstack(X)
+snrs = np.array(snrs)
+
+# ── 4. Encode Labels ──────────────────────────────────────────────────────────
+le = LabelEncoder()
+y_encoded = le.fit_transform(y)
+print("Classes:", le.classes_)
+print("X shape:", X.shape)
+
+# ── 5. Normalize ──────────────────────────────────────────────────────────────
+X = X / (np.max(np.abs(X), axis=(1, 2), keepdims=True) + 1e-8)
+
+# ── 6. Train / Val / Test Split (70 / 10 / 20) ───────────────────────────────
+X_temp, X_test, y_temp, y_test, snr_temp, snr_test = train_test_split(
+    X, y_encoded, snrs,
+    test_size=0.2,
+    random_state=42,
+    stratify=y_encoded
+)
+
+X_train, X_val, y_train, y_val, snr_train, snr_val = train_test_split(
+    X_temp, y_temp, snr_temp,
+    test_size=0.125,
+    random_state=42,
+    stratify=y_temp
+)
+
+print("Train:", X_train.shape)
+print("Val:  ", X_val.shape)
+print("Test: ", X_test.shape)
+
+# ── 7. DataLoaders ────────────────────────────────────────────────────────────
+train_loader = DataLoader(MyDataset(X_train, y_train), batch_size=128, shuffle=True)
+val_loader   = DataLoader(MyDataset(X_val,   y_val),   batch_size=128, shuffle=False)
+test_loader  = DataLoader(MyDataset(X_test,  y_test),  batch_size=128, shuffle=False)
+
+# ── 8. Device + Model ─────────────────────────────────────────────────────────
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print("Using device:", device)
+
+model = GoogLeNet1D(
+    in_channels=2,
+    n_classes=11
+).to(device)
+
+print("Model parameters:", sum(p.numel() for p in model.parameters()))
+
+# ── 9. Loss + Optimizer ───────────────────────────────────────────────────────
+criterion = nn.CrossEntropyLoss()
+optimizer = optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-4)  # weight decay added
+scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=3, factor=0.5)
+
+# ── 10. Training Loop with Early Stopping ────────────────────────────────────
+EPOCHS          = 60
+PATIENCE        = 10
+best_val_loss   = float("inf")
+patience_counter = 0
+train_losses, val_losses, val_accs = [], [], []
+
+for epoch in range(EPOCHS):
+
+    # — Train —
+    model.train()
+    running_loss = 0
+    for X_batch, y_batch in train_loader:
+        X_batch, y_batch = X_batch.to(device), y_batch.to(device)
+        optimizer.zero_grad()
+        loss = criterion(model(X_batch), y_batch)
+        loss.backward()
+        optimizer.step()
+        running_loss += loss.item()
+
+    avg_train_loss = running_loss / len(train_loader)
+    train_losses.append(avg_train_loss)
+
+    # — Validate —
+    model.eval()
+    correct, total, running_val_loss = 0, 0, 0
+    with torch.no_grad():
+        for X_batch, y_batch in val_loader:
+            X_batch, y_batch = X_batch.to(device), y_batch.to(device)
+            outputs = model(X_batch)
+            running_val_loss += criterion(outputs, y_batch).item()
+            _, predicted = torch.max(outputs, 1)
+            correct += (predicted == y_batch).sum().item()
+            total += y_batch.size(0)
+
+    avg_val_loss = running_val_loss / len(val_loader)
+    val_acc      = correct / total * 100
+    val_losses.append(avg_val_loss)
+    val_accs.append(val_acc)
+
+    scheduler.step(avg_val_loss)
+
+    # — Early Stopping + Save Best —
+    if avg_val_loss < best_val_loss:
+        best_val_loss    = avg_val_loss
+        patience_counter = 0
+        torch.save(model.state_dict(), "googlenet1d_best.pth")
+        print(f"Epoch [{epoch+1:02d}/{EPOCHS}] "
+              f"Train Loss: {avg_train_loss:.4f} | "
+              f"Val Loss: {avg_val_loss:.4f} | "
+              f"Val Acc: {val_acc:.2f}% ✅ saved")
+    else:
+        patience_counter += 1
+        print(f"Epoch [{epoch+1:02d}/{EPOCHS}] "
+              f"Train Loss: {avg_train_loss:.4f} | "
+              f"Val Loss: {avg_val_loss:.4f} | "
+              f"Val Acc: {val_acc:.2f}% "
+              f"(patience {patience_counter}/{PATIENCE})")
+        if patience_counter >= PATIENCE:
+            print(f"\nEarly stopping triggered at epoch {epoch+1}!")
+            break
+
+# ── 11. Plot Training Curves ──────────────────────────────────────────────────
+fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+
+ax1.plot(train_losses, label="Train Loss", color="blue")
+ax1.plot(val_losses,   label="Val Loss",   color="orange")
+ax1.set_title("Loss Curve - GoogLeNet1D")
+ax1.set_xlabel("Epoch")
+ax1.set_ylabel("Loss")
+ax1.legend()
+ax1.grid(True)
+
+ax2.plot(val_accs, label="Val Accuracy", color="green")
+ax2.set_title("Accuracy Curve - GoogLeNet1D")
+ax2.set_xlabel("Epoch")
+ax2.set_ylabel("Accuracy (%)")
+ax2.legend()
+ax2.grid(True)
+
+plt.tight_layout()
+plt.savefig("googlenet1d_training_curves.png", dpi=150)
+plt.show()
+print("Training curves saved!")
+
+# ── 12. Final Test Evaluation ─────────────────────────────────────────────────
+model.load_state_dict(torch.load("googlenet1d_best.pth", weights_only=True))
+model.eval()
+
+correct, total = 0, 0
+all_preds = []
+
+with torch.no_grad():
+    for X_batch, y_batch in test_loader:
+        X_batch, y_batch = X_batch.to(device), y_batch.to(device)
+        outputs = model(X_batch)
+        _, predicted = torch.max(outputs, 1)
+        correct += (predicted == y_batch).sum().item()
+        total += y_batch.size(0)
+        all_preds.extend(predicted.cpu().numpy())
+
+overall_acc = correct / total * 100
+print(f"\nFinal Test Accuracy: {overall_acc:.2f}%")
+
+# ── 13. SNR vs Accuracy ───────────────────────────────────────────────────────
+all_preds  = np.array(all_preds)
+snr_values = sorted(np.unique(snr_test))
+snr_accs   = []
+
+for snr in snr_values:
+    mask = snr_test == snr
+    acc  = accuracy_score(y_test[mask], all_preds[mask]) * 100
+    snr_accs.append(acc)
+    print(f"SNR {snr:+3d} dB → Accuracy: {acc:.2f}%")
+
+plt.figure(figsize=(12, 5))
+plt.plot(snr_values, snr_accs, marker="o", color="purple", linewidth=2)
+plt.axhline(y=overall_acc, color="red", linestyle="--",
+            label=f"Overall Accuracy ({overall_acc:.2f}%)")
+plt.title("GoogLeNet1D — Accuracy vs SNR")
+plt.xlabel("SNR (dB)")
+plt.ylabel("Accuracy (%)")
+plt.xticks(snr_values, rotation=45)
+plt.legend()
+plt.grid(True)
+plt.tight_layout()
+plt.savefig("googlenet1d_snr_accuracy.png", dpi=150)
+plt.show()
+print("All plots saved!")
